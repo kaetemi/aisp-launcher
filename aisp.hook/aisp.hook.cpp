@@ -1,7 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
+// C-style COM vtables: the screen hook patches IWebBrowser2's vtable in place and needs the
+// slot layout from the SDK header rather than hand-counted offsets.
+#define CINTERFACE
 #include <windows.h>
 #include <strsafe.h>
 #include <tlhelp32.h>
+#include <exdisp.h>
+#include <oleauto.h>
 #include <cstring>
 #include <cwchar>
 
@@ -145,6 +150,215 @@ HMODULE WINAPI HookLoadLibraryW(LPCWSTR lpLibFileName)
     return g_originalLoadLibraryW(lpLibFileName);
 }
 
+// ---------------------------------------------------------------------------------------------
+// In-game screen redirect.
+//
+// Every in-game display (room TVs, channel screens, the Nico Live billboard) is a WebBrowser
+// control hosted by the client's statically linked ATL AxHost. The host creates it with
+// CoCreateInstance(CLSID_WebBrowser) and calls IWebBrowser2::Navigate exactly once with a URL
+// built from the client's own templates, e.g.
+//   http://aisp.jp/player/jdfoiajwpefha/nicoplayer.php?movieid=<id>
+// aisp.jp no longer belongs to the game, so Navigate is patched to send that host to the
+// emulator instead:
+//   <base>/aisp.jp/player/jdfoiajwpefha/nicoplayer.php?movieid=<id>
+// <base> is "http://" + the download host from connection.txt (line 4), or the
+// AISP_SCREEN_BASE environment variable verbatim when set. Other hosts (live.nicovideo.jp)
+// are left alone; javascript: navigations pass through untouched.
+// ---------------------------------------------------------------------------------------------
+
+using CoCreateInstance_t = HRESULT(WINAPI*)(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*);
+using Navigate_t = HRESULT(STDMETHODCALLTYPE*)(IWebBrowser2*, BSTR, VARIANT*, VARIANT*, VARIANT*, VARIANT*);
+using Navigate2_t = HRESULT(STDMETHODCALLTYPE*)(IWebBrowser2*, VARIANT*, VARIANT*, VARIANT*, VARIANT*, VARIANT*);
+
+CoCreateInstance_t g_originalCoCreateInstance = nullptr;
+Navigate_t g_originalNavigate = nullptr;
+Navigate2_t g_originalNavigate2 = nullptr;
+bool g_webBrowserPatched = false;
+wchar_t g_screenBase[1024] = {};
+
+const GUID kClsidWebBrowser = {0x8856F961, 0x340A, 0x11D0, {0xA9, 0x6B, 0x00, 0xC0, 0x4F, 0xD7, 0x05, 0xA2}};
+const GUID kIidWebBrowser2 = {0xD30C1661, 0xCDAF, 0x11D0, {0x8A, 0x3E, 0x00, 0xC0, 0x4F, 0xC9, 0xE2, 0x6E}};
+
+constexpr wchar_t kScreenHost[] = L"http://aisp.jp";
+constexpr wchar_t kScreenSubdir[] = L"/aisp.jp";
+
+void DebugLog(const wchar_t* format, const wchar_t* arg)
+{
+    wchar_t line[2048] = {};
+    if (SUCCEEDED(StringCchPrintfW(line, 2048, format, arg)))
+        OutputDebugStringW(line);
+}
+
+bool BuildGameFilePath(const wchar_t* fileName, wchar_t* outPath, size_t outPathCount)
+{
+    wchar_t processPath[MAX_PATH] = {};
+    const DWORD processPathLen = GetModuleFileNameW(nullptr, processPath, MAX_PATH);
+    if (processPathLen == 0 || processPathLen >= MAX_PATH)
+        return false;
+
+    wchar_t* lastSlash = std::wcsrchr(processPath, L'\\');
+    if (!lastSlash)
+        return false;
+    *(lastSlash + 1) = L'\0';
+
+    return SUCCEEDED(StringCchCopyW(outPath, outPathCount, processPath)) && SUCCEEDED(StringCchCatW(outPath, outPathCount, fileName));
+}
+
+// connection.txt line 4 is "4,<download host>,# download ip" (written by the launcher).
+bool ReadDownloadHost(wchar_t* outHost, size_t outHostCount)
+{
+    wchar_t path[MAX_PATH] = {};
+    if (!BuildGameFilePath(L"connection.txt", path, MAX_PATH))
+        return false;
+
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+    char buffer[4096] = {};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
+    CloseHandle(file);
+    if (!ok || read == 0)
+        return false;
+    buffer[read] = '\0';
+
+    const char* line = buffer;
+    while (line && *line)
+    {
+        const char* end = std::strchr(line, '\n');
+        if (line[0] == '4' && line[1] == ',')
+        {
+            const char* host = line + 2;
+            const char* comma = std::strchr(host, ',');
+            const char* stop = comma ? comma : (end ? end : host + std::strlen(host));
+            while (stop > host && (stop[-1] == '\r' || stop[-1] == ' '))
+                --stop;
+            const int length = static_cast<int>(stop - host);
+            if (length <= 0 || static_cast<size_t>(length) >= outHostCount)
+                return false;
+            const int converted = MultiByteToWideChar(CP_ACP, 0, host, length, outHost, static_cast<int>(outHostCount) - 1);
+            if (converted <= 0)
+                return false;
+            outHost[converted] = L'\0';
+            return true;
+        }
+        line = end ? end + 1 : nullptr;
+    }
+    return false;
+}
+
+void InitScreenBase()
+{
+    if (GetEnvironmentVariableW(L"AISP_SCREEN_BASE", g_screenBase, 1024) > 0 && g_screenBase[0])
+    {
+        DebugLog(L"aisp.hook: screen base from environment: %s\n", g_screenBase);
+        return;
+    }
+
+    wchar_t host[512] = {};
+    if (!ReadDownloadHost(host, 512))
+    {
+        g_screenBase[0] = L'\0';
+        OutputDebugStringW(L"aisp.hook: no download host in connection.txt; screens are not redirected\n");
+        return;
+    }
+
+    if (FAILED(StringCchPrintfW(g_screenBase, 1024, L"http://%s", host)))
+        g_screenBase[0] = L'\0';
+    DebugLog(L"aisp.hook: screen base: %s\n", g_screenBase);
+}
+
+// Returns a new BSTR with the redirected URL, or nullptr when the URL is not on the screen host.
+BSTR RewriteScreenUrl(const wchar_t* url)
+{
+    if (!url || !g_screenBase[0])
+        return nullptr;
+
+    const size_t hostLength = std::wcslen(kScreenHost);
+    if (_wcsnicmp(url, kScreenHost, hostLength) != 0)
+        return nullptr;
+
+    const wchar_t next = url[hostLength];
+    if (next != L'/' && next != L'?' && next != L'#' && next != L'\0')
+        return nullptr; // a longer host name such as aisp.jp.example
+
+    const wchar_t* rest = url + hostLength;
+    wchar_t rewritten[4096] = {};
+    const HRESULT hr = StringCchPrintfW(rewritten, 4096, L"%s%s%s%s", g_screenBase, kScreenSubdir, (*rest == L'/' || *rest == L'\0') ? L"" : L"/", rest);
+    if (FAILED(hr))
+        return nullptr;
+
+    DebugLog(L"aisp.hook: screen navigate -> %s\n", rewritten);
+    return SysAllocString(rewritten);
+}
+
+HRESULT STDMETHODCALLTYPE HookNavigate(IWebBrowser2* self, BSTR url, VARIANT* flags, VARIANT* targetFrameName, VARIANT* postData, VARIANT* headers)
+{
+    BSTR rewritten = RewriteScreenUrl(url);
+    const HRESULT hr = g_originalNavigate(self, rewritten ? rewritten : url, flags, targetFrameName, postData, headers);
+    if (rewritten)
+        SysFreeString(rewritten);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookNavigate2(IWebBrowser2* self, VARIANT* url, VARIANT* flags, VARIANT* targetFrameName, VARIANT* postData, VARIANT* headers)
+{
+    if (url && V_VT(url) == VT_BSTR)
+    {
+        BSTR rewritten = RewriteScreenUrl(V_BSTR(url));
+        if (rewritten)
+        {
+            VARIANT replaced;
+            VariantInit(&replaced);
+            V_VT(&replaced) = VT_BSTR;
+            V_BSTR(&replaced) = rewritten;
+            const HRESULT hr = g_originalNavigate2(self, &replaced, flags, targetFrameName, postData, headers);
+            SysFreeString(rewritten);
+            return hr;
+        }
+    }
+    return g_originalNavigate2(self, url, flags, targetFrameName, postData, headers);
+}
+
+// All WebBrowser instances share ieframe's vtable, so one patch covers every screen.
+void PatchWebBrowserVtable(IUnknown* unknown)
+{
+    if (g_webBrowserPatched || !unknown)
+        return;
+
+    IWebBrowser2* browser = nullptr;
+    if (FAILED(unknown->lpVtbl->QueryInterface(unknown, kIidWebBrowser2, reinterpret_cast<void**>(&browser))) || !browser)
+        return;
+
+    IWebBrowser2Vtbl* vtable = browser->lpVtbl;
+    DWORD oldProtect = 0;
+    if (VirtualProtect(vtable, sizeof(*vtable), PAGE_READWRITE, &oldProtect))
+    {
+        g_originalNavigate = vtable->Navigate;
+        g_originalNavigate2 = vtable->Navigate2;
+        vtable->Navigate = HookNavigate;
+        vtable->Navigate2 = HookNavigate2;
+        DWORD ignored = 0;
+        VirtualProtect(vtable, sizeof(*vtable), oldProtect, &ignored);
+        g_webBrowserPatched = true;
+        OutputDebugStringW(L"aisp.hook: IWebBrowser2::Navigate patched\n");
+    }
+
+    browser->lpVtbl->Release(browser);
+}
+
+HRESULT WINAPI HookCoCreateInstance(REFCLSID clsid, LPUNKNOWN outer, DWORD context, REFIID iid, LPVOID* out)
+{
+    if (!g_originalCoCreateInstance)
+        return E_FAIL;
+
+    const HRESULT hr = g_originalCoCreateInstance(clsid, outer, context, iid, out);
+    if (SUCCEEDED(hr) && out && *out && IsEqualGUID(clsid, kClsidWebBrowser))
+        PatchWebBrowserVtable(static_cast<IUnknown*>(*out));
+    return hr;
+}
+
 template <typename T>
 bool PatchSingleImport(HMODULE module, const char* importedModuleName, const char* importName, void* replacement, T* original)
 {
@@ -257,6 +471,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(instance);
         PatchLoadedModules();
+        // The screen hook only concerns the game executable's own import of CoCreateInstance
+        // (the ATL host is linked into it); other modules keep the real one.
+        InitScreenBase();
+        PatchSingleImport(GetModuleHandleW(nullptr), "ole32.dll", "CoCreateInstance", reinterpret_cast<void*>(HookCoCreateInstance), &g_originalCoCreateInstance);
     }
     return TRUE;
 }
