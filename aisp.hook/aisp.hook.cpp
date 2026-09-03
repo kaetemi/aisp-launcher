@@ -12,6 +12,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <cwctype>
+#include <cmath>
 #include <cstring>
 #include <cwchar>
 
@@ -176,8 +177,8 @@ HMODULE WINAPI HookLoadLibraryW(LPCWSTR lpLibFileName)
 // The client draws a screen by calling OleDraw on the browser's document every frame and
 // copying a fixed rectangle out of the result. That import is hooked too: when the page names a
 // stream source in its title, the page is left idle and the
-// pixels come from ffmpeg instead: twitch:<channel> through streamlink, stream:<url> straight
-// into ffmpeg. Video arrives as raw BGRA
+// pixels come from ffmpeg instead: streamlink:<url> through streamlink, stream:<url> straight
+// into ffmpeg; the server translates its own ids (tw:, lv…) into those. Video arrives as raw BGRA
 // frames at the crop size on ffmpeg's stdout, audio as 32-bit float at the device's mix format
 // on a named pipe, and both go through jitter buffers: the audio device is the clock and the
 // presenter shows the frame matching the samples played. Volume and mute come from the page,
@@ -449,10 +450,50 @@ BSTR RewriteScreenUrl(const wchar_t* url)
 
 // --- streams ---------------------------------------------------------------------------------
 
-constexpr int kStreamFps = 30;            // ffmpeg's fps filter makes the video constant-rate
-constexpr int kBufferFrames = 90;          // 3 s ring
-constexpr int kPrerollFrames = 45;         // start after 1.5 s queued
-constexpr int kResumeFrames = 20;          // after an underrun, resume once this much is queued
+constexpr int kDefaultFps = 30;           // ffmpeg's fps filter makes the video constant-rate; the page may pick another
+// The decoded rings are small on purpose: jitter is absorbed on the compressed side (streamlink's
+// lead and buffer, ffmpeg paced at real time). A frame has to wait in the ring only from the
+// moment ffmpeg emits it next to its audio until that audio is actually heard, which is the
+// audio device's 200 ms head start; twelve frames cover that with slack. (Three, the classic
+// video-only queue, would block ffmpeg's video output before the audio thread had its lead.)
+constexpr int kRingMs = 400;               // decoded frames kept ahead of the picture
+constexpr int kPrerollMs = 200;            // start once this much is queued
+constexpr int kResumeMs = 100;             // after an underrun, resume once this much is queued
+constexpr size_t kRingBudgetBytes = 64u << 20; // per screen (a full Stage crop at 30 fps is 24 MB)
+constexpr int kMinBufferFrames = 3;
+
+int FramesFor(int ms, int fps)
+{
+    const int frames = ms * fps / 1000;
+    return frames < 1 ? 1 : frames;
+}
+
+// Ring length for a frame size and rate: kRingMs if that fits the budget, fewer frames otherwise.
+int RingCapacityFor(DWORD frameBytes, int fps)
+{
+    const int wanted = FramesFor(kRingMs, fps);
+    const size_t fit = frameBytes ? kRingBudgetBytes / frameBytes : static_cast<size_t>(wanted);
+    return static_cast<int>(fit < static_cast<size_t>(kMinBufferFrames) ? kMinBufferFrames : (fit > static_cast<size_t>(wanted) ? wanted : fit));
+}
+
+int PrerollFor(int capacity, int fps)
+{
+    const int wanted = FramesFor(kPrerollMs, fps);
+    return wanted < capacity / 2 ? wanted : capacity / 2;
+}
+
+int ResumeFor(int capacity, int fps)
+{
+    const int wanted = FramesFor(kResumeMs, fps);
+    return wanted < capacity / 3 ? wanted : capacity / 3;
+}
+
+// Rates the page may ask for: those that divide 44100 and 48000 evenly, so a frame is a whole
+// number of samples and the audio clock maps to frames exactly.
+bool IsSupportedFps(int fps)
+{
+    return fps == 15 || fps == 20 || fps == 25 || fps == 30 || fps == 50 || fps == 60;
+}
 // Full rings block their reader instead of dropping: ffmpeg then blocks on its pipe and
 // streamlink's own buffer absorbs the segment bursts, so nothing is ever skipped and the
 // latency is bounded by the ring. The audio ring is larger so it never blocks first.
@@ -479,7 +520,20 @@ struct ScreenStream
     bool playing = false;
     LONGLONG nextPresent = 0;            // video-only clock (QPC) when there is no audio
     int titlePoll = 0;
+    int fps = kDefaultFps;               // constant output rate ffmpeg is told to produce
+    int pageFps = 0;                     // fps=N from the page title (0: none given)
     wchar_t pageSource[512] = {};        // src=... from the page title, applied by OleDraw
+    int pageBox[4] = {};                 // box=x,y,w,h from the page title (w == 0: none given)
+    // Colour keying: when the page names a key colour, only the pixels of the page that are
+    // exactly that colour receive video; anything else the page draws inside the box stays on
+    // top (the overlay-surface trick of the DirectDraw era).
+    bool keyed = false;
+    DWORD keyColor = 0;                  // 0x00RRGGBB
+    HDC keyDc = nullptr;
+    HBITMAP keyBitmap = nullptr;
+    HGDIOBJ keyOldBitmap = nullptr;
+    BYTE* keyBits = nullptr;
+    int keyWidth = 0, keyHeight = 0;
 
     // Audio ring (float32 interleaved): sample s at s % audioCapacity for s in [audioPos, audioWritten).
     bool audioWanted = false;            // a device was found; ffmpeg produces audio
@@ -494,6 +548,14 @@ struct ScreenStream
     LONGLONG audioPlayed = 0;            // samples actually out of the speaker (audioPos - device padding)
     float volume = 1.0f;                 // 0..1 from the page, already perceptual
     bool muted = false;
+    // Distance rolloff: the page names the screen's world position and a near/far range
+    // (audio=x,y,z,near,far); the hook reads the listener from the client every frame.
+    bool rolloff = false;
+    float sourcePos[3] = {};
+    float nearDistance = 0, farDistance = 0;
+    float distanceGain = 1.0f;           // target from the geometry, per frame
+    float panLeft = 1.0f, panRight = 1.0f;
+    float smoothGain = 1.0f, smoothLeft = 1.0f, smoothRight = 1.0f; // eased in the render thread
     HANDLE audioPipe = INVALID_HANDLE_VALUE;
     wchar_t audioPipeName[128] = {};
     WAVEFORMATEX* mixFormat = nullptr;
@@ -545,11 +607,11 @@ void LogStats(ScreenStream* stream)
     const LONGLONG queuedFrames = stream->videoWritten - stream->videoPos;
     const LONGLONG queuedSamples = stream->audioWritten - stream->audioPos;
     const int queuedAudioMs = stream->sampleRate ? static_cast<int>(queuedSamples * 1000 / stream->sampleRate) : -1;
-    const LONGLONG avDriftMs = (stream->audioActive && stream->samplesPerFrame) ? (stream->audioPlayed / stream->samplesPerFrame - (stream->videoPos - 1)) * 1000 / kStreamFps : 0;
+    const LONGLONG avDriftMs = (stream->audioActive && stream->samplesPerFrame) ? (stream->audioPlayed / stream->samplesPerFrame - (stream->videoPos - 1)) * 1000 / stream->fps : 0;
     StringCchPrintfA(
         line,
         512,
-        "stats %lu: vq=%lld aq=%dms playing=%d audio=%d vpos=%lld vwritten=%lld aplayed=%lld drift=%lldms underruns=%ld vwaits=%ld awaits=%ld held=%d\r\n",
+        "stats %lu: vq=%lld aq=%dms playing=%d audio=%d vpos=%lld vwritten=%lld aplayed=%lld drift=%lldms underruns=%ld vwaits=%ld awaits=%ld held=%d dgain=%.2f pan=%.2f/%.2f\r\n",
         static_cast<unsigned long>(GetTickCount64() / 1000),
         queuedFrames,
         queuedAudioMs,
@@ -562,7 +624,10 @@ void LogStats(ScreenStream* stream)
         stream->underruns,
         stream->videoWaits,
         stream->audioWaits,
-        (GetTickCount64() - stream->lastDraw > kAudioHoldMs) ? 1 : 0
+        (GetTickCount64() - stream->lastDraw > kAudioHoldMs) ? 1 : 0,
+        stream->distanceGain,
+        stream->panLeft,
+        stream->panRight
     );
     LeaveCriticalSection(&stream->lock);
     LogLine(line);
@@ -738,7 +803,7 @@ bool PrepareAudio(ScreenStream* stream)
                     stream->mixFormat = format;
                     stream->sampleRate = format->nSamplesPerSec;
                     stream->channels = format->nChannels;
-                    stream->samplesPerFrame = stream->sampleRate / kStreamFps;
+                    stream->samplesPerFrame = stream->sampleRate / stream->fps;
                     ok = true;
                 }
                 else
@@ -758,6 +823,113 @@ bool PrepareAudio(ScreenStream* stream)
 float GainOf(const ScreenStream* stream)
 {
     return stream->muted ? 0.0f : stream->volume;
+}
+
+// The client's own avatar. Found by memory search against the position the server reported,
+// verified across movement and turning, and cross-checked against a disassembly of the 6.4 MB
+// client (image base 0x400000, loads unrelocated). Layout, all offsets verified live:
+//   [0xA489AC]       chara manager block (plain data, no vtable); the CCharaTable* global sits
+//                    right after it at 0xA489B0.
+//   +0xC -> +0x0     slot holding the local CChara* (vtable 0x93A144).
+//   CChara+0xC       chara type; the controller factory (jump table 0x40F68C) makes a
+//                    CSelfCharaController for type 9, CPlayerController for type 1. So 9 = self.
+//   CChara+0x20      CAIModel* (vtable 0x974E84; CAIModel -> CHLModel -> dxModel -> dxObject).
+//                    CChara::GetPos at 0x402300 calls its vtable slot 4 (0x6DC370:
+//                    lea eax,[ecx+0x18]) and only falls back to the embedded vec3 at CChara+0x28
+//                    when +0x20 is null. That fallback keeps the spawn position on a live avatar,
+//                    so always go via the model.
+//   CChara+0x60      controller; for the local avatar a CSelfCharaController (vtable 0x93AD24,
+//                    +0x4 points back at the CChara). Used below as the "this is us" check. Its
+//                    +0x38 is not a position cache (denormal junk), despite looking like one.
+//   CAIModel+0x18    x, y, z (world units, the same numbers the server sees in move packets).
+//   CAIModel+0x24    rotation quaternion x, y, z, w ((0,1,0,0) at yaw 180 matches the matrix).
+//   CAIModel+0x40    the position again (slot 5/16 getter 0x453C50); tracks +0x18 exactly.
+//   CAIModel+0x68    4x4 world matrix: row 0 = right, row 2 = forward, row 3 = translation.
+// CAIModel shares the getter thunks of the base dxObject table (vtable 0x99DBBC), but the
+// field names next to that base table ("slot 4 = scale") do not apply here: slot 4 is position.
+constexpr DWORD kSelfCharaControllerVtable = 0x93AD24;
+
+bool ReadableAt(const void* address, size_t size)
+{
+    MEMORY_BASIC_INFORMATION info = {};
+    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT)
+        return false;
+    const DWORD protect = info.Protect & 0xFF;
+    if (protect == PAGE_NOACCESS || protect == PAGE_EXECUTE || (info.Protect & PAGE_GUARD))
+        return false;
+    return reinterpret_cast<const BYTE*>(address) + size <= reinterpret_cast<const BYTE*>(info.BaseAddress) + info.RegionSize;
+}
+
+bool ReadListener(float* position, float* forward, float* right)
+{
+    if (GetModuleHandleW(nullptr) != reinterpret_cast<HMODULE>(0x400000))
+        return false;
+    const BYTE* a = *reinterpret_cast<BYTE* const*>(0xA489AC);
+    if (!a || !ReadableAt(a + 0xC, 4))
+        return false;
+    const BYTE* b = *reinterpret_cast<BYTE* const*>(a + 0xC);
+    if (!b || !ReadableAt(b, 4))
+        return false;
+    const BYTE* chara = *reinterpret_cast<BYTE* const*>(b);
+    if (!chara || !ReadableAt(chara, 0x64))
+        return false;
+    // Only trust the chain while the slot holds the avatar driven by the local controller.
+    const BYTE* controller = *reinterpret_cast<BYTE* const*>(chara + 0x60);
+    if (!controller || !ReadableAt(controller, 8))
+        return false;
+    if (*reinterpret_cast<const DWORD*>(controller) != kSelfCharaControllerVtable
+        || *reinterpret_cast<BYTE* const*>(controller + 4) != chara)
+        return false;
+    const BYTE* entity = *reinterpret_cast<BYTE* const*>(chara + 0x20);
+    if (!entity || !ReadableAt(entity, 0xA8))
+        return false;
+    const float* pos = reinterpret_cast<const float*>(entity + 0x18);
+    const float* m = reinterpret_cast<const float*>(entity + 0x68);
+    for (int i = 0; i < 3; ++i)
+    {
+        position[i] = pos[i];
+        right[i] = m[i];
+        forward[i] = m[8 + i];
+    }
+    // Sanity: a real position is finite and modest, the matrix rows are unit-ish.
+    for (int i = 0; i < 3; ++i)
+        if (!(position[i] == position[i]) || position[i] > 1e7f || position[i] < -1e7f)
+            return false;
+    const float f2 = forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2];
+    return f2 > 0.25f && f2 < 4.0f;
+}
+
+// Distance gain and stereo pan for a stream from the listener. Call under the stream lock.
+void UpdateRolloff(ScreenStream* stream, const float* listener, const float* forward, const float* right, bool haveListener)
+{
+    (void)forward;
+    if (!stream->rolloff || !haveListener)
+    {
+        stream->distanceGain = 1.0f;
+        stream->panLeft = stream->panRight = 1.0f;
+        return;
+    }
+    float d[3];
+    for (int i = 0; i < 3; ++i)
+        d[i] = stream->sourcePos[i] - listener[i];
+    const float dist = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    float gain = 1.0f;
+    if (stream->farDistance > stream->nearDistance)
+    {
+        if (dist >= stream->farDistance)
+            gain = 0.0f;
+        else if (dist > stream->nearDistance)
+            gain = (stream->farDistance - dist) / (stream->farDistance - stream->nearDistance);
+    }
+    stream->distanceGain = gain;
+    // Pan by the bearing of the source against the avatar's right vector (horizontal only),
+    // constant power, never fully one-sided.
+    float pan = 0.0f;
+    const float horiz = sqrtf(d[0] * d[0] + d[2] * d[2]);
+    if (horiz > 1.0f)
+        pan = (d[0] * right[0] + d[2] * right[2]) / horiz * 0.7f;
+    stream->panLeft = sqrtf((1.0f - pan) * 0.5f) * 1.4142f;
+    stream->panRight = sqrtf((1.0f + pan) * 0.5f) * 1.4142f;
 }
 
 // Pipe -> audio ring. Audio only becomes the clock once ffmpeg has actually opened the pipe.
@@ -849,13 +1021,18 @@ DWORD WINAPI AudioRenderThread(LPVOID parameter)
         const LONGLONG available = stream->audioWritten - stream->audioPos;
         if (feed && available >= static_cast<LONGLONG>(want))
         {
-            const float gain = GainOf(stream);
+            // Ease the geometry-driven gains over this buffer so steps never click.
+            stream->smoothGain += (stream->distanceGain - stream->smoothGain) * 0.2f;
+            stream->smoothLeft += (stream->panLeft - stream->smoothLeft) * 0.2f;
+            stream->smoothRight += (stream->panRight - stream->smoothRight) * 0.2f;
+            const float gain = GainOf(stream) * stream->smoothGain;
             for (UINT32 i = 0; i < want; ++i)
             {
                 const float* src = stream->audioRing + ((stream->audioPos + i) % stream->audioCapacity) * stream->channels;
                 for (UINT32 c = 0; c < stream->channels; ++c)
                 {
-                    const float sample = src[c] * gain;
+                    const float channelGain = c == 0 ? stream->smoothLeft : (c == 1 ? stream->smoothRight : 1.0f);
+                    const float sample = src[c] * gain * channelGain;
                     if (isFloat)
                         reinterpret_cast<float*>(out)[i * stream->channels + c] = sample;
                     else
@@ -905,13 +1082,15 @@ DWORD WINAPI StreamThread(LPVOID parameter)
     // Decide what ffmpeg reads: a piped transport stream from streamlink, or a URL.
     HANDLE ffmpegInput = nullptr;
     wchar_t input[2048] = {};
-    const bool isTwitch = _wcsnicmp(stream->source, L"twitch:", 7) == 0;
-    if (isTwitch)
+    // streamlink:<url> goes through streamlink into ffmpeg; stream:<url> straight into ffmpeg.
+    // Which site an id belongs to is the server's business: it hands the page the final URL.
+    const bool viaStreamlink = _wcsnicmp(stream->source, L"streamlink:", 11) == 0;
+    if (viaStreamlink)
     {
-        const wchar_t* channel = stream->source + 7;
+        const wchar_t* pageUrl = stream->source + 11;
         if (ToolPath(L"AISP_STREAMLINK", L"streamlink\\bin\\streamlink.exe", streamlink, MAX_PATH))
         {
-            StringCchPrintfW(message, 512, L"streamlink: twitch.tv/%s", channel);
+            StringCchPrintfW(message, 512, L"streamlink: %s", pageUrl);
             SetStatus(stream, message);
             HANDLE readEnd = nullptr, writeEnd = nullptr;
             if (!CreateInheritablePipe(&readEnd, &writeEnd, false))
@@ -919,11 +1098,12 @@ DWORD WINAPI StreamThread(LPVOID parameter)
                 SetStatus(stream, L"pipe creation failed");
                 return 0;
             }
-            // Ads are skipped by default in current streamlink; cap the quality below 720p. No
-            // low-latency mode: it chases the live edge with a two segment window and delivers
+            // No low-latency mode: it chases the live edge with a two segment window and delivers
             // in stalls and bursts, which is what the screen shows; the default edge and a large
             // ring buffer on streamlink's side keep the delivery steady at a few seconds' delay.
-            StringCchPrintfW(command, 4096, L"\"%s\" --stdout --ringbuffer-size 64M --stream-sorting-excludes \">=720p\" https://twitch.tv/%s best", streamlink, channel);
+            // Ads are skipped by default in current streamlink; the resolution cap applies where
+            // stream names carry one (Twitch) and is ignored elsewhere.
+            StringCchPrintfW(command, 4096, L"\"%s\" --stdout --ringbuffer-size 64M --stream-sorting-excludes \">=720p\" \"%s\" best", streamlink, pageUrl);
             stream->processes[1] = LaunchTool(command, nullptr, writeEnd);
             CloseHandle(writeEnd);
             if (!stream->processes[1])
@@ -940,9 +1120,9 @@ DWORD WINAPI StreamThread(LPVOID parameter)
         }
         else if (ToolPath(L"AISP_YTDLP", L"yt-dlp.exe", ytdlp, MAX_PATH))
         {
-            StringCchPrintfW(message, 512, L"yt-dlp: resolving twitch.tv/%s", channel);
+            StringCchPrintfW(message, 512, L"yt-dlp: resolving %s", pageUrl);
             SetStatus(stream, message);
-            StringCchPrintfW(command, 4096, L"\"%s\" -g --no-warnings -f \"best[height<=480]/best\" https://twitch.tv/%s", ytdlp, channel);
+            StringCchPrintfW(command, 4096, L"\"%s\" -g --no-warnings -f \"best[height<=480]/best\" \"%s\"", ytdlp, pageUrl);
             if (!RunToolForLine(command, input, 2048) || _wcsnicmp(input, L"http", 4) != 0)
             {
                 SetStatus(stream, L"yt-dlp returned no playlist URL (offline? see aisp.screen.log)");
@@ -962,7 +1142,7 @@ DWORD WINAPI StreamThread(LPVOID parameter)
     }
     else
     {
-        SetStatus(stream, L"unknown source; use twitch:<channel> or stream:<url>");
+        SetStatus(stream, L"unknown source; expected streamlink:<url> or stream:<url>");
         return 0;
     }
 
@@ -1012,7 +1192,7 @@ DWORD WINAPI StreamThread(LPVOID parameter)
         stream->videoHeight,
         stream->videoWidth,
         stream->videoHeight,
-        kStreamFps,
+        stream->fps,
         audioOutput
     );
     stream->processes[0] = LaunchTool(command, ffmpegInput, frameWrite);
@@ -1101,6 +1281,16 @@ void StopSession(ScreenStream* stream)
 void FreeRings(ScreenStream* stream)
 {
     EnterCriticalSection(&stream->lock);
+    if (stream->keyDc)
+    {
+        SelectObject(stream->keyDc, stream->keyOldBitmap);
+        DeleteObject(stream->keyBitmap);
+        DeleteDC(stream->keyDc);
+        stream->keyDc = nullptr;
+        stream->keyBitmap = nullptr;
+        stream->keyBits = nullptr;
+        stream->keyWidth = stream->keyHeight = 0;
+    }
     delete[] stream->ring;
     delete[] stream->audioRing;
     stream->ring = nullptr;
@@ -1122,13 +1312,16 @@ void StartSession(ScreenStream* stream)
     stream->titlePoll = 0;
     stream->underruns = stream->videoWaits = stream->audioWaits = 0;
     if (!stream->ring)
+    {
+        stream->capacity = RingCapacityFor(stream->frameBytes, stream->fps);
         stream->ring = new BYTE[static_cast<size_t>(stream->frameBytes) * static_cast<size_t>(stream->capacity)]();
+    }
     LeaveCriticalSection(&stream->lock);
 
     stream->audioWanted = PrepareAudio(stream);
     if (stream->audioWanted)
     {
-        const LONGLONG audioCapacity = static_cast<LONGLONG>(stream->sampleRate) * kBufferFrames * 3 / 2 / kStreamFps;
+        const LONGLONG audioCapacity = static_cast<LONGLONG>(stream->sampleRate) * stream->capacity * 3 / 2 / stream->fps;
         EnterCriticalSection(&stream->lock);
         if (!stream->audioRing || stream->audioCapacity != audioCapacity)
         {
@@ -1189,7 +1382,6 @@ void OnScreenNavigate(IWebBrowser2* browser, const wchar_t* url)
         stream = new ScreenStream();
         InitializeCriticalSection(&stream->lock);
         stream->browser = identity;
-        stream->capacity = kBufferFrames;
         stream->next = g_streams;
         g_streams = stream;
     }
@@ -1197,10 +1389,9 @@ void OnScreenNavigate(IWebBrowser2* browser, const wchar_t* url)
 
     // Crop rectangles the client copies out of the control (see the frame routine): live pages
     // (URL with /lv) 950x520 placed at the page's flvplayer_container, which the emulator's
-    // page puts at the origin; everything else 486x343 at (9,15). The video box is what the
-    // panel shows of that crop: a TV shows all of it, the Stage wall's main LED shows page
-    // (7,65)-(550,447) (measured in game with the page's c: outlines; the banner above it,
-    // (7,7)-(550,60), is left to the page).
+    // page puts at the origin; everything else 486x343 at (9,15). The video box is where a
+    // stream is painted inside that crop; the page normally states it in its title (box=), these
+    // are the fallbacks: a TV's whole crop, the Stage wall's main LED (7,65)-(550,447).
     int x = 9, y = 15, width = 486, height = 343;
     int videoX = 0, videoY = 0, videoWidth = 486, videoHeight = 343;
     if (std::wcsstr(url, L"/lv"))
@@ -1230,6 +1421,8 @@ void OnScreenNavigate(IWebBrowser2* browser, const wchar_t* url)
     stream->frameBytes = frameBytes;
     stream->source[0] = L'\0';
     stream->pageSource[0] = L'\0';
+    stream->pageFps = 0;
+    std::memset(stream->pageBox, 0, sizeof(stream->pageBox));
     if (stream->html)
     {
         stream->html->lpVtbl->Release(stream->html);
@@ -1307,8 +1500,21 @@ void PollTitle(ScreenStream* stream)
     {
         // Only sources the hook decodes count; the page frames web pages itself.
         const wchar_t* src = std::wcsstr(title, L";src=");
-        const bool stream_ = src && (_wcsnicmp(src + 5, L"twitch:", 7) == 0 || _wcsnicmp(src + 5, L"stream:", 7) == 0);
+        const bool stream_ = src && (_wcsnicmp(src + 5, L"streamlink:", 11) == 0 || _wcsnicmp(src + 5, L"stream:", 7) == 0);
         StringCchCopyW(stream->pageSource, 512, stream_ ? src + 5 : L"");
+        // Where the page wants the video, in crop coordinates; it knows what each panel shows.
+        const wchar_t* fpsText = std::wcsstr(title, L";fps=");
+        int fps = 0;
+        stream->pageFps = (fpsText && swscanf(fpsText + 5, L"%d", &fps) == 1 && IsSupportedFps(fps)) ? fps : 0;
+        const wchar_t* keyText = std::wcsstr(title, L";key=");
+        unsigned int key = 0;
+        stream->keyed = keyText && swscanf(keyText + 5, L"%6x", &key) == 1;
+        stream->keyColor = key & 0xFFFFFF;
+        int box[4] = {};
+        const wchar_t* boxText = std::wcsstr(title, L";box=");
+        if (boxText && swscanf(boxText + 5, L"%d,%d,%d,%d", &box[0], &box[1], &box[2], &box[3]) == 4 && box[2] > 0 && box[3] > 0
+            && box[0] >= 0 && box[1] >= 0 && box[0] + box[2] <= stream->width && box[1] + box[3] <= stream->height)
+            std::memcpy(stream->pageBox, box, sizeof(box));
     }
     if (const wchar_t* vol = std::wcsstr(title, L"vol="))
     {
@@ -1318,7 +1524,62 @@ void PollTitle(ScreenStream* stream)
     }
     if (const wchar_t* mute = std::wcsstr(title, L"mute="))
         stream->muted = mute[5] == L'1';
+    if (const wchar_t* audio = std::wcsstr(title, L";audio="))
+    {
+        float v[5] = {};
+        stream->rolloff = swscanf(audio + 7, L"%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]) == 5 && v[4] > v[3] && v[3] >= 0;
+        if (stream->rolloff)
+        {
+            stream->sourcePos[0] = v[0];
+            stream->sourcePos[1] = v[1];
+            stream->sourcePos[2] = v[2];
+            stream->nearDistance = v[3];
+            stream->farDistance = v[4];
+        }
+    }
+    else
+    {
+        stream->rolloff = false;
+    }
     SysFreeString(title);
+}
+
+// A DIB the size of the video box, to read the page's pixels back and composite in.
+bool EnsureKeySurface(ScreenStream* stream, HDC reference)
+{
+    if (stream->keyDc && stream->keyWidth == stream->videoWidth && stream->keyHeight == stream->videoHeight)
+        return true;
+    if (stream->keyDc)
+    {
+        SelectObject(stream->keyDc, stream->keyOldBitmap);
+        DeleteObject(stream->keyBitmap);
+        DeleteDC(stream->keyDc);
+        stream->keyDc = nullptr;
+        stream->keyBitmap = nullptr;
+        stream->keyBits = nullptr;
+    }
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = stream->videoWidth;
+    info.bmiHeader.biHeight = -stream->videoHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    stream->keyDc = CreateCompatibleDC(reference);
+    stream->keyBitmap = stream->keyDc ? CreateDIBSection(stream->keyDc, &info, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!stream->keyBitmap)
+    {
+        if (stream->keyDc)
+            DeleteDC(stream->keyDc);
+        stream->keyDc = nullptr;
+        return false;
+    }
+    stream->keyOldBitmap = SelectObject(stream->keyDc, stream->keyBitmap);
+    stream->keyBits = static_cast<BYTE*>(bits);
+    stream->keyWidth = stream->videoWidth;
+    stream->keyHeight = stream->videoHeight;
+    return true;
 }
 
 HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bounds)
@@ -1328,17 +1589,39 @@ HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bou
         return g_originalOleDraw(unknown, aspect, hdc, bounds);
     stream->lastDraw = GetTickCount64();
 
-    // What the page says to play, applied when it changes: start, replace, or stop.
+    // What the page says to play and where, applied when either changes: start, replace, or stop.
     wchar_t wanted[512] = {};
+    int wantedBox[4] = {};
     EnterCriticalSection(&stream->lock);
     PollTitle(stream);
     StringCchCopyW(wanted, 512, stream->pageSource);
-    const bool changed = std::wcscmp(wanted, stream->source) != 0;
+    std::memcpy(wantedBox, stream->pageBox, sizeof(wantedBox));
+    const bool boxChanged = wantedBox[2] > 0
+        && (wantedBox[0] != stream->videoX || wantedBox[1] != stream->videoY || wantedBox[2] != stream->videoWidth || wantedBox[3] != stream->videoHeight);
+    const int wantedFps = stream->pageFps ? stream->pageFps : kDefaultFps;
+    const bool fpsChanged = wantedFps != stream->fps;
+    const bool changed = std::wcscmp(wanted, stream->source) != 0 || boxChanged || fpsChanged;
     LeaveCriticalSection(&stream->lock);
     if (changed)
     {
         StopSession(stream);
         StringCchCopyW(stream->source, 512, wanted);
+        if (fpsChanged)
+        {
+            FreeRings(stream); // the ring length is a duration; re-derive it for the new rate
+            stream->fps = wantedFps;
+        }
+        if (boxChanged)
+        {
+            const DWORD frameBytes = static_cast<DWORD>(wantedBox[2]) * static_cast<DWORD>(wantedBox[3]) * 4;
+            if (frameBytes != stream->frameBytes)
+                FreeRings(stream);
+            stream->videoX = wantedBox[0];
+            stream->videoY = wantedBox[1];
+            stream->videoWidth = wantedBox[2];
+            stream->videoHeight = wantedBox[3];
+            stream->frameBytes = frameBytes;
+        }
     }
     if (!stream->sessionActive)
     {
@@ -1353,7 +1636,7 @@ HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bou
     // itself first so the rest of the crop, the banner, still shows the page; a TV's video box is
     // the whole crop, so the page draw is skipped there.
     const bool videoFillsCrop = stream->videoX == 0 && stream->videoY == 0 && stream->videoWidth == stream->width && stream->videoHeight == stream->height;
-    if (videoFillsCrop)
+    if (videoFillsCrop && !stream->keyed)
         FillRect(hdc, bounds, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
     else
         g_originalOleDraw(unknown, aspect, hdc, bounds);
@@ -1361,6 +1644,12 @@ HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bou
     const int y = bounds->top + stream->y;
 
     EnterCriticalSection(&stream->lock);
+    if (stream->rolloff)
+    {
+        float listener[3], forward[3], right[3];
+        const bool have = ReadListener(listener, forward, right);
+        UpdateRolloff(stream, listener, forward, right, have);
+    }
 
     // Pre-roll, then present: with audio, the frame that matches what the speaker has played;
     // without, one frame per interval on the performance counter. Underruns hold the last
@@ -1369,7 +1658,7 @@ HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bou
     const bool hasAudio = stream->audioActive;
     if (!stream->playing)
     {
-        const int needed = stream->videoPos == 0 ? kPrerollFrames : kResumeFrames;
+        const int needed = stream->videoPos == 0 ? PrerollFor(stream->capacity, stream->fps) : ResumeFor(stream->capacity, stream->fps);
         const bool audioReady = !hasAudio || stream->audioWritten - stream->audioPos >= static_cast<LONGLONG>(needed) * stream->samplesPerFrame;
         if (queued >= needed && audioReady)
         {
@@ -1392,7 +1681,7 @@ HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bou
             LARGE_INTEGER now = {}, frequency = {};
             QueryPerformanceCounter(&now);
             QueryPerformanceFrequency(&frequency);
-            const LONGLONG interval = frequency.QuadPart / kStreamFps;
+            const LONGLONG interval = frequency.QuadPart / stream->fps;
             while (now.QuadPart >= stream->nextPresent)
             {
                 if (stream->videoPos >= stream->videoWritten)
@@ -1416,7 +1705,25 @@ HRESULT WINAPI HookOleDraw(LPUNKNOWN unknown, DWORD aspect, HDC hdc, LPCRECT bou
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = BI_RGB;
         const BYTE* shown = stream->ring + static_cast<size_t>((stream->videoPos - 1) % stream->capacity) * stream->frameBytes;
-        SetDIBitsToDevice(hdc, x + stream->videoX, y + stream->videoY, stream->videoWidth, stream->videoHeight, 0, 0, 0, stream->videoHeight, shown, &info, DIB_RGB_COLORS);
+        const int bx = x + stream->videoX, by = y + stream->videoY;
+        if (stream->keyed && EnsureKeySurface(stream, hdc))
+        {
+            // Read the page under the box, put video where it painted the key colour, write back.
+            BitBlt(stream->keyDc, 0, 0, stream->videoWidth, stream->videoHeight, hdc, bx, by, SRCCOPY);
+            GdiFlush();
+            const DWORD key = stream->keyColor;
+            DWORD* page = reinterpret_cast<DWORD*>(stream->keyBits);
+            const DWORD* video = reinterpret_cast<const DWORD*>(shown);
+            const size_t count = static_cast<size_t>(stream->videoWidth) * static_cast<size_t>(stream->videoHeight);
+            for (size_t i = 0; i < count; ++i)
+                if ((page[i] & 0xFFFFFF) == key)
+                    page[i] = video[i];
+            BitBlt(hdc, bx, by, stream->videoWidth, stream->videoHeight, stream->keyDc, 0, 0, SRCCOPY);
+        }
+        else
+        {
+            SetDIBitsToDevice(hdc, bx, by, stream->videoWidth, stream->videoHeight, 0, 0, 0, stream->videoHeight, shown, &info, DIB_RGB_COLORS);
+        }
     }
     else
     {
